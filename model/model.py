@@ -74,6 +74,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from transformers.activations import ACT2FN
 
 # RMSNorm
 class RMSNorm(nn.Module):
@@ -248,9 +249,130 @@ class Attention(nn.Module):
         output = self.o_proj(output)
         return output, past_kv
     
-
+# FFN with Gating
 class FeedForward(nn.Module):
     def __init__(self, args:MyMindConfig):
         super().__init__()
         if args.intermediate_size is None:
             intermediate_size = 8/3*args.hidden_size
+            intermediate_size = int(64*((intermediate_size+64-1)//64))
+        else:
+            intermediate_size = args.intermediate_size
+
+        self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.dropout = nn.Dropout(args.dropout)
+        self.activation = ACT2FN[args.hidden_act]
+
+    def forward(self, x:torch.Tensor):
+        return self.dropout(
+            self.down_proj(self.activation(self.up_proj(x))*self.gate_proj(x))
+        )
+    
+
+class MymindBlock(nn.Module):
+    def __init__(self, args:MyMindConfig, layer_id: int):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_dim = args.hidden_size
+        self.attn = Attention(args)
+
+        self.layer_id = layer_id
+        self.input_ln = RMSNorm(self.hidden_dim, eps = args.rms_norm_eps)
+        self.post_ln = RMSNorm(self.hidden_dim, eps = args.rms_norm_eps)
+        self.ffn = FeedForward(args)
+
+    def forward(self, 
+                hidden_state: torch.Tensor, 
+                pos_emb: Tuple[torch.Tensor, torch.Tensor],
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]]=None,
+                use_kv_cache: bool=False,
+                attention_mask: Optional[torch.Tensor]=None,
+                ):
+        residual = hidden_state
+        hidden_state, past_kv = self.attn(
+            self.input_ln(hidden_state),
+            pos_emb,
+            past_kv,
+            use_kv_cache,
+            attention_mask
+        )
+        hidden_state = residual + hidden_state
+        hidden_state = hidden_state+self.ffn(self.post_ln(hidden_state))
+        return hidden_state, past_kv
+    
+
+class MymindModel(nn.Module):
+    def __init__(self, args:MyMindConfig):
+        super().__init__()
+        self.vocab_size = args.vocab_size
+        self.hidden_dim = args.hidden_size
+        
+        self.embeddings = nn.Embedding(args.vocab_size,
+                                       args.hidden_size)
+        self.dropout = nn.Dropout(args.dropout)
+
+        self.layers = nn.ModuleList(
+            [MymindBlock(args, i) for i in range(args.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(args.hidden_size, eps = args.rms_norm_eps)
+
+        # Rope预计算
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=args.hidden_size//args.num_attention_heads,
+            end=args.max_position_embeddings,
+            rope_base=args.rope_theta,
+            rope_scaling=args.rope_scaling
+        )
+
+        self.register_buffer(
+            "freqs_cos", freqs_cos, persistent=False
+        )
+        self.register_buffer(
+            "freqs_sin", freqs_sin, persistent=False
+        )
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor]=None,
+                attention_mask: Optional[torch.Tensor]=None,
+                past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]=None,
+                use_kv_cache: bool=False,
+                **kwargs,
+                ):
+        batch_size, seq_len = input_ids.shape
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+        
+        past_key_values = past_key_values or [None]*len(self.layers)
+        
+        start_pos = (
+            past_key_values[0][0].size(1) if past_key_values[0] is not None else 0
+        )
+
+        hidden_state = self.dropout(
+            self.embeddings(input_ids)
+        )
+
+        pos_emb = (
+            self.freqs_cos[start_pos: start_pos + seq_len],
+            self.freqs_sin[start_pos: start_pos + seq_len],
+        )
+
+        present_key_values = []
+        for layer_idx, (layer, past_kv) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_state, present_kv = layer(
+                hidden_state,
+                pos_emb,
+                past_kv,
+                use_kv_cache,
+                attention_mask,
+            )
+            present_key_values.append(present_kv)
+
+        hidden_state = self.norm(hidden_state)
+
+        return hidden_state, present_key_values
+    
