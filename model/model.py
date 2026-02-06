@@ -72,6 +72,7 @@ class MyMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 # RMSNorm
@@ -167,8 +168,8 @@ class Attention(nn.Module):
         
 
         self.q_proj = nn.Linear(self.hidden_dim, self.head_dim*self.num_attention_heads, bias=False)
-        self.k_proj = nn.Linear(self.hidden_dim, self.head_dim*self.num_attention_heads, bias=False)
-        self.v_proj = nn.Linear(self.hidden_dim, self.head_dim*self.num_attention_heads, bias=False)
+        self.k_proj = nn.Linear(self.hidden_dim, self.num_key_value_heads*self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_dim, self.num_key_value_heads*self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.head_dim*self.num_attention_heads, self.hidden_dim, bias=False)
 
         self.attn_dropout = nn.Dropout(args.dropout)
@@ -182,15 +183,74 @@ class Attention(nn.Module):
                 pos_emb:Tuple[torch.Tensor, torch.Tensor], 
                 past_kv:Optional[Tuple[torch.Tensor, torch.Tensor]]=None,
                 use_kv_cache:bool=False,
-                attention_mask:Optional[torch.Tensor]=None,)->torch.Tensor:
+                attention_mask:Optional[torch.Tensor]=None,):
         batch_size, seq_len, _= x.shape
         xq, xk, xv= self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # reshape for multi-head attention
         xq= xq.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
-        xk= xk.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
-        xv= xv.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        xk= xk.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        xv= xv.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
 
         # q, k rotary embedding
         cos, sin = pos_emb
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        if past_kv is not None:
+            xk = torch.cat([past_kv[0], xk], dim=1)
+            xv = torch.cat([past_kv[1], xv], dim=1)
+        past_kv = (xk, xv) if use_kv_cache else None
+
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2)
+        )
+
+        if self.flash and seq_len>1 and (attention_mask is None or
+                                         torch.all(attention_mask==1)):
+            attn_mask = (
+                None 
+                if attention_mask is None 
+                else attention_mask.view(batch_size, 1, 1, -1).expand(
+                    batch_size, self.num_attention_heads, seq_len, -1
+                ).bool()
+            )
+            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask, 
+                                                    self.dropout if self.training else 0.,
+                                                    is_causal=True)
+        else:
+            score = xq @ xk.transpose(-1, -2)/math.sqrt(self.head_dim)
+            
+            # 创建因果掩码 (causal mask)
+            kv_seq_len = xk.size(2)  # key 的序列长度
+            past_len = kv_seq_len - seq_len
+            causal_mask = torch.tril(
+                torch.ones(seq_len, kv_seq_len, device=score.device, dtype=torch.bool),
+                diagonal=past_len,
+            )
+            score = score.masked_fill(causal_mask[None, None, :, :] == 0, float("-inf"))
+            
+            # 如果有 padding mask，也应用
+            if attention_mask is not None:
+                if attention_mask.size(-1) != kv_seq_len:
+                    pad_len = kv_seq_len - attention_mask.size(-1)
+                    if pad_len > 0:
+                        attention_mask = F.pad(attention_mask, (pad_len, 0), value=1)
+                padding_mask = attention_mask[:, None, None, :].bool()
+                score = score.masked_fill(~padding_mask, float("-inf"))
+        
+            score = F.softmax(score.float(), dim = -1)
+            score = self.attn_dropout(score)
+            output = score@xv
+        output = output.transpose(1, 2).contiguous().view(batch_size,
+                                                          seq_len,
+                                                          self.head_dim*self.num_attention_heads)
+        output = self.o_proj(output)
+        return output, past_kv
+    
+
+class FeedForward(nn.Module):
+    def __init__(self, args:MyMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = 8/3*args.hidden_size
