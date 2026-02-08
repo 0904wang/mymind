@@ -1,5 +1,5 @@
 from transformers import PretrainedConfig
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 class MyMindConfig(PretrainedConfig):
     model_type = "mymind"
@@ -11,7 +11,7 @@ class MyMindConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 512,
-        intermediate_size: int = None,
+        intermediate_size: Optional[int] = None,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -73,6 +73,7 @@ class MyMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
 import math
 from transformers.activations import ACT2FN
 
@@ -107,19 +108,19 @@ def precompute_freqs_cis(dim:int,
             rope_scaling.get("beta_fast", 4),
             rope_scaling.get("beta_slow", 1)
         )
-        
-        corr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
+        if end>orig_max:
+            corr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
 
-    # 计算power
-        power = torch.arange(0, dim//2, device=freqs.device).float()/max(dim//2-1, 1)
-    # 计算beta
-        beta = (beta_fast ** power) * (beta_slow ** (1 - power))
-    # 计算scale
-        scale = torch.where(torch.arange(dim//2, device=freqs.device)<corr_dim,
-                            (beta*factor-beta+1)/(beta*factor),
-                            1./factor)
-        
-        freqs *= scale 
+        # 计算power
+            power = torch.arange(0, dim//2, device=freqs.device).float()/max(dim//2-1, 1)
+        # 计算beta
+            beta = (beta_fast ** power) * (beta_slow ** (1 - power))
+        # 计算scale
+            scale = torch.where(torch.arange(dim//2, device=freqs.device)<corr_dim,
+                                (beta*factor-beta+1)/(beta*factor),
+                                1./factor)
+            
+            freqs *= scale 
     
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
@@ -249,6 +250,169 @@ class Attention(nn.Module):
         output = self.o_proj(output)
         return output, past_kv
     
+class MoEGate(nn.Module):
+    def __init__(self, args:MyMindConfig):
+        super().__init__()
+        self.args = args
+        self.top_k = args.num_experts_per_tok
+        self.n_routed_experts = args.n_routed_experts
+        
+        self.scoring_func = args.scoring_func
+        self.alpha = args.aux_loss_alpha
+        self.seq_aux = args.seq_aux
+
+        self.norm_topk_prob = args.norm_topk_prob
+        self.gating_dim = args.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_state:torch.Tensor):
+        batch_size, seq_len, _ = hidden_state.shape
+        hidden_state = hidden_state.view(-1, hidden_state.size(-1))
+
+        logits = F.linear(hidden_state, self.weight, None)
+
+        if self.scoring_func=="softmax":
+            score = F.softmax(logits, dim=-1)
+        elif self.scoring_func=="sigmoid":
+            score = torch.sigmoid(logits)
+        else:
+            raise ValueError(f"Unsupported scoring function: {self.scoring_func}")
+        
+        topk_weights, topk_indices = torch.topk(
+            score, self.top_k, dim=-1, sorted=False
+        )
+
+
+        # 归一化
+        if self.top_k>1 and self.norm_topk_prob:
+            denominator = topk_weights.sum(dim=-1, keepdim=True)+1e-20
+
+            topk_weights = topk_weights/denominator
+        
+        # 计算辅助损失
+        if self.training and self.alpha>0.:
+            scores_for_aux = score
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_indices.view(batch_size, -1)
+            
+            # 序列级别的辅助损失
+            if self.seq_aux:
+                scores_for_aux = scores_for_aux.view(batch_size, seq_len, self.n_routed_experts)
+                ce = torch.zeros(
+                    batch_size, self.n_routed_experts, device=hidden_state.device
+                )
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(batch_size, seq_len*aux_topk, device=hidden_state.device)
+                )
+
+                ce = ce.div(seq_len*aux_topk/self.n_routed_experts)
+                aux_loss= (ce*scores_for_aux.mean(dim=1)).sum(dim=-1).mean()*self.alpha
+            
+            # 批次级别的辅助损失
+            else:
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                ce = mask_ce.float().sum(dim=0)
+                Pi = scores_for_aux.mean(dim=0)
+                fi = ce*self.n_routed_experts
+                aux_loss = (fi*Pi).sum()*self.alpha
+        else:
+            aux_loss = hidden_state.new_tensor(0.0)
+        
+        return topk_weights, topk_indices, aux_loss
+
+class MoEFeedForward(nn.Module):
+    def __init__(self, args:MyMindConfig):
+        super().__init__()
+        self.args = args
+        self.expert_ffns = nn.ModuleList(
+            [FeedForward(args) for _ in range(args.n_routed_experts)]
+        )
+        self.gate = MoEGate(args)
+        if args.n_shared_experts>0:
+            self.shared_ffns = nn.ModuleList(
+                [FeedForward(args) for _ in range(args.n_shared_experts)]
+            )
+
+    def forward(self, hidden_state:torch.Tensor):
+        identity = hidden_state
+        orin_shape = hidden_state.shape
+        batch_size, seq_len, hidden_dim = orin_shape
+
+        topk_weights, topk_indices, aux_loss = self.gate(hidden_state)
+
+        hidden_state = hidden_state.view(-1, hidden_dim)
+        flat_topk_indices = topk_indices.view(-1)
+
+        if self.training and aux_loss>0.:
+            hidden_state = hidden_state.repeat_interleave(
+                self.args.num_experts_per_tok, dim=0
+            ) 
+            y = torch.zeros_like(hidden_state)
+
+            for i, expert in enumerate(self.expert_ffns):
+                mask = flat_topk_indices == i
+                if mask.any():
+                    y[mask] = expert(hidden_state[mask])
+            y = (y.view(*topk_weights.shape, -1) * topk_weights.unsqueeze(-1)).sum(dim=1)
+            y = y.view(orin_shape)
+        else:
+            y = self.moe_infer(hidden_state, flat_topk_indices, topk_weights.view(-1, 1)).view(orin_shape)
+        
+        # 添加共享专家的输出
+        if self.args.n_shared_experts > 0:
+            for shared_expert in self.shared_ffns:
+                y = y + shared_expert(identity)
+        
+        self.aux_loss = aux_loss
+        return y
+                
+
+
+    @torch.no_grad()
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 使用cache，创建一个和x形状相同的零张量
+        expert_cache = torch.zeros_like(x)
+        # 对专家索引进行排序，最后是[0,0,0,1,1,2,2,2,...]这样的顺序
+        # 分拣
+        idxs = flat_expert_indices.argsort()
+        # 统计每个专家被分配到的token数量
+        # 打包
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 计算每个token对应的专家索引
+        token_idxs = idxs // self.args.num_experts_per_tok
+        # 对每个打包好的包进行处理
+        for i, end_idx in enumerate(tokens_per_expert):
+            # 计算当前包的起始位置
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            # 取出当前包对应的专家
+            expert = self.expert_ffns[i]
+            # 取出token对应的原始id
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 取出token对应的数据
+            expert_tokens = x[exp_token_idx]
+            # 计算专家输出，一次性处理当前包的所有token
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 加权
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将结果散点加到缓存中对应位置
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+
+        return expert_cache
+
 # FFN with Gating
 class FeedForward(nn.Module):
     def __init__(self, args:MyMindConfig):
@@ -281,7 +445,13 @@ class MymindBlock(nn.Module):
         self.layer_id = layer_id
         self.input_ln = RMSNorm(self.hidden_dim, eps = args.rms_norm_eps)
         self.post_ln = RMSNorm(self.hidden_dim, eps = args.rms_norm_eps)
-        self.ffn = FeedForward(args)
+        
+        # 根据配置选择FFN类型
+        if args.use_moe:
+            self.ffn = MoEFeedForward(args)
+        else:
+            self.ffn = FeedForward(args)
+        self.use_moe = args.use_moe
 
     def forward(self, 
                 hidden_state: torch.Tensor, 
@@ -300,12 +470,16 @@ class MymindBlock(nn.Module):
         )
         hidden_state = residual + hidden_state
         hidden_state = hidden_state+self.ffn(self.post_ln(hidden_state))
-        return hidden_state, past_kv
+        
+        # 如果使用MoE，返回aux_loss
+        aux_loss = self.ffn.aux_loss if self.use_moe else None
+        return hidden_state, past_kv, aux_loss
     
 
 class MymindModel(nn.Module):
     def __init__(self, args:MyMindConfig):
         super().__init__()
+        self.args = args
         self.vocab_size = args.vocab_size
         self.hidden_dim = args.hidden_size
         
@@ -360,10 +534,11 @@ class MymindModel(nn.Module):
         )
 
         present_key_values = []
+        aux_loss = None
         for layer_idx, (layer, past_kv) in enumerate(
             zip(self.layers, past_key_values)
         ):
-            hidden_state, present_kv = layer(
+            hidden_state, present_kv, layer_aux_loss = layer(
                 hidden_state,
                 pos_emb,
                 past_kv,
@@ -371,8 +546,80 @@ class MymindModel(nn.Module):
                 attention_mask,
             )
             present_key_values.append(present_kv)
+            # 累积aux_loss
+            if layer_aux_loss is not None:
+                aux_loss = layer_aux_loss if aux_loss is None else aux_loss + layer_aux_loss
 
         hidden_state = self.norm(hidden_state)
 
-        return hidden_state, present_key_values
+        return hidden_state, present_key_values, aux_loss
+
+
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
+class MymindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MyMindConfig
+    def __init__(self, config: MyMindConfig):
+        self.config = config
+        super().__init__(config)
+        self.model = MymindModel(config)
+        self.lm_head = nn.Linear(self.config.hidden_size,
+                                 self.config.vocab_size, bias=False)
+        self.model.embeddings.weight = self.lm_head.weight
+        self.post_init()
+    
+    def forward(self, 
+                input_ids:Optional[torch.Tensor]=None,
+                attention_mask:Optional[torch.Tensor]=None,
+                past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]=None,
+                use_kv_cache: bool=False,
+                labels: Optional[torch.Tensor]=None,
+                logits_to_keep: Union[int, torch.Tensor]=0,
+                **args):
+        hidden_state, past_kv, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_kv_cache=use_kv_cache,
+            **args
+        )
+
+        # 计算loss时需要完整的logits（用于trainer外部loss计算）
+        # 推理时可以只计算部分logits以提高效率
+        if labels is not None or logits_to_keep == 0:
+            logits = self.lm_head(hidden_state)
+        else:
+            slice_indices = (
+                slice(-logits_to_keep, None) if isinstance(logits_to_keep, int)
+                else logits_to_keep
+            )
+            logits = self.lm_head(hidden_state[:, slice_indices, :])
+        
+        # 如果提供了labels，计算loss（用于HuggingFace标准训练）
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = nn.CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+            
+            # 添加aux_loss
+            if aux_loss is not None:
+                loss = loss + aux_loss
+        
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_kv,
+            hidden_states=(hidden_state,),
+        )
+        # 为trainer添加aux_loss属性
+        output.aux_loss = aux_loss if aux_loss is not None else torch.tensor(0.0, device=logits.device)
+        
+        return output
     
