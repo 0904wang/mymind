@@ -7,27 +7,49 @@ class MyMindConfig(PretrainedConfig):
     def __init__(
         self,
         dropout: float = 0.0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
+        
+        # 1. 适配 Qwen Tokenizer 的关键设置
+        # Qwen 词表大小通常是 151936 (151643 + padding)
+        vocab_size: int = 151936,
+        # 强制指定 <|endoftext|> (ID: 151643) 为 BOS/EOS，这对预训练至关重要
+        bos_token_id: int = 151643,
+        eos_token_id: int = 151643,
+        
         hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: Optional[int] = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
-        vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
+        
+        # 2. 模型尺寸 (Base Model Scale: ~2B)
+        # 2048 维度配合 24 层是经典的 2B 模型架构，在 5090 上训练效率极高
+        hidden_size: int = 2048,
+        # Intermediate Size 通常为 Hidden * 3.5 左右 (SwiGLU)
+        # MoE 的 FFN 维度可以稍微大一点
+        intermediate_size: int = 5632, 
+        
+        max_position_embeddings: int = 8192, # 8K 上下文
+        
+        num_attention_heads: int = 16,   # Head Dim = 2048 / 16 = 128
+        num_hidden_layers: int = 24,
+        num_key_value_heads: int = 8,    # GQA (Grouped Query Attention) 2:1，节省显存
+        
+        rms_norm_eps: float = 1e-06,
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
-        ############ MoE ############
-        use_moe: bool = False,
-        num_experts_per_tok: int = 2,
-        n_routed_experts: int = 4,
-        n_shared_experts: int = 1,
+        
+        ############ MoE 核心配置 (DeepSeek-V2/V3 风格) ############
+        use_moe: bool = True,
+        
+        # 激活参数控制：每次只用 2 个专家 + 1 个共享专家
+        num_experts_per_tok: int = 2,  
+        
+        # 总专家数：8 个路由专家
+        # 总参数量 ≈ Base + 8 * Experts
+        n_routed_experts: int = 8,     
+        
+        # 共享专家：1 个 (关键！这能显著稳定训练，减少 MoE 常见的“专家坍缩”问题)
+        n_shared_experts: int = 1,     
+        
         scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.1,
+        aux_loss_alpha: float = 0.01,  # 负载均衡损失系数，0.01 是经验值
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
         **kwargs,
@@ -60,9 +82,9 @@ class MyMindConfig(PretrainedConfig):
 
         self.rope_scaling = (
             {
-                "beta_fast": 4,
+                "beta_fast": 32,
                 "beta_slow": 1,
-                "factor": 4,
+                "factor": 0.5,
                 "original_max_position_embeddings": 2048,
                 "type": "yarn",
             }

@@ -39,17 +39,38 @@ class PretrainDataset(IterableDataset):
                     continue
 
     def process_sample(self, sample):
-        """将文本转换为模型输入格式 (与你之前的逻辑保持一致)"""
+        """将文本转换为模型输入格式"""
         encoding = self.tokenizer(
             str(sample['text']),
             max_length=self.max_length,
             padding='max_length',
             truncation=True,
-            return_tensors='pt'
+            return_tensors='pt',
+            add_special_tokens=False  # 【关键1】关闭自动添加，手动控制
         )
+        
         input_ids = encoding['input_ids'].squeeze(0)
+        attention_mask = encoding['attention_mask'].squeeze(0)  # 1=有效token, 0=padding
+        
+        # 【关键2】使用 attention_mask 准确定位真实数据的结尾
+        # 这比查找 pad_token_id 更可靠，避免文本中本身就有该 token 的歧义
+        valid_length = attention_mask.sum().item()  # 真实token数量
+        
+        # 【关键3】在真实数据后手动添加 <|endoftext|> (ID: 151643)
+        if valid_length < self.max_length:
+            # 有空间：在真实数据后追加 EOS
+            input_ids[valid_length] = 151643
+        else:
+            # 满了：替换最后一个 token 为 EOS（确保序列以 EOS 结尾）
+            input_ids[self.max_length - 1] = 151643
+        
+        # 【关键4】生成 loss_mask
+        # 注意：EOS 也应该参与 loss 计算（模型需要学会生成 EOS）
         loss_mask = input_ids != self.tokenizer.pad_token_id
 
+        # 【关键5】生成训练对 (input, target)
+        # x: [tok1, tok2, ..., tokN-1]  预测下一个
+        # y: [tok2, tok3, ..., tokN]    目标序列（包含EOS）
         x = input_ids[:-1].clone().detach().long()
         y = input_ids[1:].clone().detach().long()
         loss_mask = loss_mask[1:].clone().detach().bool()
