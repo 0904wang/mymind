@@ -36,8 +36,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     loss_fct = nn.CrossEntropyLoss(reduction="none")
     start_time = time.time()  # 记录开始时间
 
-    # 遍历数据批次
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+    # IterableDataset 流式读取，使用固定步数循环
+    loader_iter = iter(loader)
+    for step in range(start_step + 1, iters + 1):
+        try:
+            X, Y, loss_mask = next(loader_iter)
+        except StopIteration:
+            break  # 数据读完则停止（理论上cycle不会停）
+            
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
@@ -183,7 +189,19 @@ if __name__ == "__main__":
         "--data_path",
         type=str,
         default="dataset/pretrain_hq.jsonl",
-        help="预训练数据路径",
+        help="预训练数据路径（多个路径用逗号分隔）",
+    )
+    parser.add_argument(
+        "--data_probs",
+        type=str,
+        default=None,
+        help="数据集混合概率（逗号分隔，需与data_path数量一致，默认均匀采样）",
+    )
+    parser.add_argument(
+        "--iters_per_epoch",
+        type=int,
+        default=10000,
+        help="每个epoch训练的步数（流式数据集需要指定）",
     )
     parser.add_argument(
         "--from_weight",
@@ -297,9 +315,23 @@ if __name__ == "__main__":
     # 初始化模型和分词器
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 📚 多数据集混合知识点
+    # 支持多个数据源按概率混合，例如：通用语料 + 代码语料
+    data_paths = [p.strip() for p in args.data_path.split(',')]
+    data_probs = None
+    if args.data_probs:
+        data_probs = [float(p.strip()) for p in args.data_probs.split(',')]
+        assert len(data_paths) == len(data_probs), "数据路径数量必须与概率数量一致"
+    
+    train_ds = PretrainDataset(
+        data_paths, 
+        tokenizer, 
+        max_length=args.max_seq_len,
+        probabilities=data_probs
+    )
 
-    train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    # 📚 IterableDataset 不支持 DistributedSampler
+    # 流式数据集在多worker环境下通过内部随机性实现分片
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
 
@@ -323,35 +355,26 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
-    for epoch in range(start_epoch, args.epochs):
-        # 📚 分布式采样器epoch设置
-        # 每个epoch设置不同的随机种子，确保数据顺序随机化
-        if train_sampler:
-            train_sampler.set_epoch(epoch)
+    # 📚 IterableDataset 配置知识点
+    # 流式数据集不需要 shuffle（内部已随机混合）
+    # 不需要 sampler（数据是无限流）
+    loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,  # 避免最后不完整的batch
+    )
 
-        # 📚 断点续训逻辑
-        if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-            # 使用跳批采样器，跳过已训练的数据
-            batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
-            )
-            loader = DataLoader(
-                train_ds,
-                batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
+    for epoch in range(start_epoch, args.epochs):
+        # 📚 流式数据集训练逻辑
+        # 使用固定的 iters_per_epoch 控制每个 epoch 的训练步数
+        if epoch == start_epoch and start_step > 0:
             Logger(
-                f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
+                f"Epoch [{epoch + 1}/{args.epochs}]: 从step {start_step + 1}开始继续训练"
             )
-            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
-        else:  # 默认从头开始
-            loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                shuffle=(train_sampler is None),
-                sampler=train_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, args.iters_per_epoch, start_step, wandb)
+        else:
+            train_epoch(epoch, loader, args.iters_per_epoch, 0, wandb)
+        
+        Logger(f"Epoch [{epoch + 1}/{args.epochs}] 完成！")
